@@ -6,6 +6,8 @@ Python standard library (``math``, ``cmath``) and pytest are required.
 
 from __future__ import annotations
 
+import cmath
+import math
 from typing import Any, Mapping, Sequence
 
 DEFAULT_MAX_JUMP_HZ = 400.0
@@ -25,7 +27,11 @@ def autocorr(frame: Sequence[float], order: int) -> list[float]:
 
     Tolerance for comparisons: 1e-6.
     """
-    raise NotImplementedError("autocorr is not implemented yet")
+    n = len(frame)
+    return [
+        sum(frame[t] * frame[t + k] for t in range(n - k))
+        for k in range(order + 1)
+    ]
 
 
 def levinson(r: Sequence[float], order: int) -> dict:
@@ -48,7 +54,61 @@ def levinson(r: Sequence[float], order: int) -> dict:
     prediction polynomial is observable as an inverted synthetic signal.
     Tolerance for comparisons: 1e-6.
     """
-    raise NotImplementedError("levinson is not implemented yet")
+    r = [float(value) for value in r]
+    a = [1.0]
+    reflection: list[float] = []
+    error = r[0]
+    for i in range(1, order + 1):
+        acc = r[i] + sum(a[j] * r[i - j] for j in range(1, i))
+        k = -acc / error if error != 0.0 else 0.0
+        reflection.append(k)
+        prev = a
+        a = [1.0] + [prev[j] + k * prev[i - j] for j in range(1, i)] + [k]
+        error *= 1.0 - k * k
+    return {"coefficients": a, "reflection": reflection, "error": error}
+
+
+def _polyval(coeffs: Sequence[complex], z: complex) -> complex:
+    value = 0j
+    for c in coeffs:
+        value = value * z + c
+    return value
+
+
+def _poly_roots(coeffs: Sequence[complex]) -> list[complex]:
+    """Durand-Kerner root finder for a polynomial, highest degree first."""
+    coeffs = [complex(c) for c in coeffs]
+    while len(coeffs) > 1 and coeffs[0] == 0:
+        coeffs.pop(0)
+    degree = len(coeffs) - 1
+    if degree <= 0:
+        return []
+    lead = coeffs[0]
+    coeffs = [c / lead for c in coeffs]
+    if degree == 1:
+        return [-coeffs[1]]
+    seed = 0.4 + 0.9j
+    z = 1 + 0j
+    roots: list[complex] = []
+    for _ in range(degree):
+        z *= seed
+        roots.append(z)
+    for _ in range(500):
+        max_delta = 0.0
+        for i in range(degree):
+            denom = 1 + 0j
+            for j in range(degree):
+                if i != j:
+                    denom *= roots[i] - roots[j]
+            if denom == 0:
+                denom = 1e-12 + 0j
+            delta = _polyval(coeffs, roots[i]) / denom
+            roots[i] -= delta
+            if abs(delta) > max_delta:
+                max_delta = abs(delta)
+        if max_delta < 1e-13:
+            break
+    return roots
 
 
 def lpc_roots(coeffs: Sequence[complex]) -> list[complex]:
@@ -63,7 +123,7 @@ def lpc_roots(coeffs: Sequence[complex]) -> list[complex]:
     stable inside the unit circle.  Order is unspecified.  Root residual
     accuracy: 1e-6.
     """
-    raise NotImplementedError("lpc_roots is not implemented yet")
+    return [z for z in _poly_roots(coeffs) if abs(z) < 1.0]
 
 
 def poles_to_formants(roots: Sequence[complex], sample_rate: float) -> list[dict]:
@@ -80,7 +140,91 @@ def poles_to_formants(roots: Sequence[complex], sample_rate: float) -> list[dict
     that only want formants must reject them first.  Results are sorted by
     increasing frequency.  Tolerance: 1e-6.
     """
-    raise NotImplementedError("poles_to_formants is not implemented yet")
+    formants = []
+    for z in roots:
+        z = complex(z)
+        if z.imag < 0.0:
+            continue
+        magnitude = abs(z)
+        formants.append(
+            {
+                "frequency": abs(cmath.phase(z)) * sample_rate / (2.0 * math.pi),
+                "bandwidth": -math.log(magnitude) * sample_rate / math.pi,
+            }
+        )
+    formants.sort(key=lambda entry: entry["frequency"])
+    return formants
+
+
+def _frame_formants(
+    frame: Sequence[float], sample_rate: float, order: int
+) -> list[dict]:
+    """Candidate formants of a single frame, non-formant poles rejected."""
+    r = autocorr(frame, order)
+    coeffs = levinson(r, order)["coefficients"]
+    roots = lpc_roots(coeffs)
+    upper = MAX_FORMANT_RATIO * sample_rate
+    candidates = []
+    for root in roots:
+        if root.imag <= 0.0:
+            # Real poles are not resonances; the lower-half-plane mirrors
+            # are the same resonances as their upper-half conjugates.
+            continue
+        if not any(abs(root.conjugate() - other) <= 1e-6 for other in roots):
+            continue
+        frequency = abs(cmath.phase(root)) * sample_rate / (2.0 * math.pi)
+        bandwidth = -math.log(abs(root)) * sample_rate / math.pi
+        if frequency < MIN_FORMANT_HZ or frequency > upper:
+            continue
+        if bandwidth <= 0.0:
+            continue
+        candidates.append({"frequency": frequency, "bandwidth": bandwidth})
+    candidates.sort(key=lambda entry: entry["frequency"])
+    return candidates
+
+
+def _track(
+    frames: Sequence[Sequence[float]],
+    sample_rate: float,
+    order: int,
+    max_jump_hz: float,
+) -> list:
+    results = []
+    tracks: list[dict] = []  # persistent label -> last frequency state
+    next_label = 1
+    for frame in frames:
+        candidates = _frame_formants(frame, sample_rate, order)
+        used: set[int] = set()
+        entries = []
+        for candidate in candidates:
+            best = None
+            best_diff = max_jump_hz
+            for index, track in enumerate(tracks):
+                if index in used:
+                    continue
+                diff = abs(candidate["frequency"] - track["frequency"])
+                if diff <= best_diff:
+                    best = index
+                    best_diff = diff
+            if best is not None:
+                label = tracks[best]["label"]
+                tracks[best]["frequency"] = candidate["frequency"]
+                used.add(best)
+            else:
+                label = f"F{next_label}"
+                next_label += 1
+                tracks.append({"label": label, "frequency": candidate["frequency"]})
+                used.add(len(tracks) - 1)
+            entries.append(
+                {
+                    "label": label,
+                    "frequency": candidate["frequency"],
+                    "bandwidth": candidate["bandwidth"],
+                }
+            )
+        entries.sort(key=lambda entry: entry["frequency"])
+        results.append(entries)
+    return results
 
 
 def track_formants(frames: Sequence[Sequence[float]], sample_rate: float, order: int) -> list:
@@ -102,7 +246,7 @@ def track_formants(frames: Sequence[Sequence[float]], sample_rate: float, order:
     discarded as non-formants.  Missing tracks may be absent from a frame;
     labels are never renumbered per frame.  Tolerance: 1e-6.
     """
-    raise NotImplementedError("track_formants is not implemented yet")
+    return _track(frames, sample_rate, order, DEFAULT_MAX_JUMP_HZ)
 
 
 def synthesize(formants: Sequence[Mapping[str, float]], sample_rate: float, n: int) -> list[float]:
@@ -121,7 +265,24 @@ def synthesize(formants: Sequence[Mapping[str, float]], sample_rate: float, n: i
     peak absolute value is 0.9.  ``n`` samples are returned as floats.
     Tolerance: 1e-6.
     """
-    raise NotImplementedError("synthesize is not implemented yet")
+    raw = []
+    for t in range(n):
+        tau = t + SYNTH_PREWARM
+        total = 0.0
+        for formant in formants:
+            amplitude = float(formant.get("amplitude", 1.0))
+            frequency = float(formant["frequency"])
+            bandwidth = float(formant["bandwidth"])
+            total += (
+                amplitude
+                * math.exp(-math.pi * bandwidth * tau / sample_rate)
+                * math.sin(2.0 * math.pi * frequency * tau / sample_rate)
+            )
+        raw.append(total)
+    peak = max((abs(value) for value in raw), default=0.0)
+    if peak > 0.0:
+        raw = [0.9 * value / peak for value in raw]
+    return raw
 
 
 def validate_poles(roots: Sequence[complex]) -> list[str]:
@@ -134,7 +295,21 @@ def validate_poles(roots: Sequence[complex]) -> list[str]:
     poles and unpaired real poles must both be reported, never treated as
     formants.  Tolerance: 1e-6.
     """
-    raise NotImplementedError("validate_poles is not implemented yet")
+    roots = [complex(z) for z in roots]
+    errors: list[str] = []
+    has_conjugate_pair = False
+    for z in roots:
+        if abs(z) >= 1.0 - STABILITY_TOL:
+            errors.append(f"unstable pole {z}: |z| = {abs(z):.6f} is not inside the unit circle")
+        if abs(z.imag) <= STABILITY_TOL:
+            errors.append(f"real pole {z.real:.6f} is not a resonance")
+        elif any(abs(z.conjugate() - other) <= 1e-6 for other in roots):
+            has_conjugate_pair = True
+        else:
+            errors.append(f"pole {z} has no conjugate partner")
+    if not has_conjugate_pair:
+        errors.append("no conjugate pole pair present")
+    return errors
 
 
 def track_batch(tracks: Sequence[Mapping[str, Any]], config: Mapping[str, Any]) -> dict:
@@ -148,4 +323,14 @@ def track_batch(tracks: Sequence[Mapping[str, Any]], config: Mapping[str, Any]) 
     ``{"results": [track_formants(...), ...], "count": len(tracks)}``.
     Tolerance: 1e-6.
     """
-    raise NotImplementedError("track_batch is not implemented yet")
+    max_jump_hz = float(config.get("max_jump_hz", DEFAULT_MAX_JUMP_HZ))
+    results = [
+        _track(
+            track["frames"],
+            float(track["sample_rate"]),
+            int(track["order"]),
+            max_jump_hz,
+        )
+        for track in tracks
+    ]
+    return {"results": results, "count": len(tracks)}
